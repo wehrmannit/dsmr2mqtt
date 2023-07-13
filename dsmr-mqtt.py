@@ -115,23 +115,6 @@ t_parse = convert.ParseTelegrams(trigger, t_threads_stopper, t_mqtt, telegram)
 t_discovery = ha.Discovery(t_threads_stopper, t_mqtt, __version__)
 
 
-def exit_gracefully(signal, stackframe):
-  """
-  Exit_gracefully
-
-  Keyword arguments:
-    :param int signal: the associated signalnumber
-    :param str stackframe: current stack frame
-    :return:
-  """
-
-  logger.debug(f"Signal {signal}: >>")
-
-  # status=0/SUCCESS
-  __exit_code = 0
-
-  t_threads_stopper.set()
-  logger.info("<<")
 
 
 def main():
@@ -172,8 +155,6 @@ def main():
 # ------------------------------------------------------------------------------------
 if __name__ == '__main__':
   logger.debug("__main__: >>")
-  signal.signal(signal.SIGINT, exit_gracefully)
-  signal.signal(signal.SIGTERM, exit_gracefully)
 
   # start main program
   main()

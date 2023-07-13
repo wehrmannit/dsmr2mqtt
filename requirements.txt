@@ -8,6 +8,14 @@ persist-queue
 # https://pypi.org/project/persist-queue/
 # sudo pip3 install persist-queue --user
 
+cryptography
+# https://pypi.org/project/cryptography /
+# sudo pip3 install cryptography --user
+
+pycryptodome
+# https://pypi.org/project/pycryptodome /
+# sudo pip3 install pycryptodome --user
+
 pyserial
 # add root (or user which runs script) to group dialout  (/etc/groups)
 

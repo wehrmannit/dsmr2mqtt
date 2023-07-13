@@ -25,7 +25,14 @@ import serial
 import threading
 import time
 import re
+import binascii
+import argparse
 
+
+from Cryptodome.Cipher import AES
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.ciphers import (Cipher, algorithms, modes)
+from cryptography.exceptions import InvalidTag
 import config as cfg
 
 # Logging
@@ -54,18 +61,47 @@ class TaskReadSerial(threading.Thread):
     self.__stopper = stopper
     self.__telegram = telegram
     self.__counter = 0
+    self.STATE_IGNORING = 0
+    # Start byte (hex "DB") has been detected.
+    self.STATE_STARTED = 1
+    # Length of system title has been read.
+    self.STATE_HAS_SYSTEM_TITLE_LENGTH = 2
+    # System title has been read.
+    self.STATE_HAS_SYSTEM_TITLE = 3
+    # Additional byte after the system title has been read.
+    self.STATE_HAS_SYSTEM_TITLE_SUFFIX = 4
+    # Length of remaining data has been read.
+    self.STATE_HAS_DATA_LENGTH = 5
+    # Additional byte after the remaining data length has been read.
+    self.STATE_HAS_SEPARATOR = 6
+    # Frame counter has been read.
+    self.STATE_HAS_FRAME_COUNTER = 7
+    # Payload has been read.
+    self.STATE_HAS_PAYLOAD = 8
+    # GCM tag has been read.
+    self.STATE_HAS_GCM_TAG = 9
+    # All input has been read. After this, we switch back to STATE_IGNORING and wait for a new start byte.
+    self.STATE_DONE = 10
+    # Initial empty values. These will be filled as content is read
+    # and they will be reset each time we go back to the initial state.
+    self._state = self.STATE_IGNORING
+    self._buffer = ""
+    self._buffer_length = 0
+    self._next_state = 0
+    self._system_title_length = 0
+    self._system_title = b""
+    self._data_length_bytes = b""  # length of "remaining data" in bytes
+    self._data_length = 0  # length of "remaining data" as an integer
+    self._frame_counter = b""
+    self._payload = b""
+    self._gcm_tag = b""
+    self._args = {}
 
-    # [ Serial parameters ]
-    if cfg.PRODUCTION:
-      self.__tty = serial.Serial()
-      self.__tty.port = cfg.ser_port
-      self.__tty.baudrate = cfg.ser_baudrate
-      self.__tty.bytesize = serial.SEVENBITS
-      self.__tty.parity = serial.PARITY_EVEN
-      self.__tty.stopbits = serial.STOPBITS_ONE
-      self.__tty.xonxoff = 0
-      self.__tty.rtscts = 0
-      self.__tty.timeout = 20
+    self.__tty = serial.Serial()
+    self.__tty.port = cfg.ser_port
+    self.__tty.baudrate = cfg.ser_baudrate
+    self.__tty.parity = serial.PARITY_NONE
+    self.__tty.stopbits = serial.STOPBITS_ONE
 
     try:
       if cfg.PRODUCTION:
@@ -139,73 +175,151 @@ class TaskReadSerial(threading.Thread):
 
 
   def __read_serial(self):
-    """
-      Opens & Closes serial port
-      Reads dsmr telegrams; stores in global variable (self.__telegram)
-      Sets threading event to signal other clients (parser) that
-      new telegram is available.
-      In non-production mode, reads telegrams from file
 
-    Returns:
-      None
-    """
-    logger.debug(">>")
+    try:
+      raw_data = self.__tty.read()
+    except Exception as e:
+      print(e)
+      return
 
-    while not self.__stopper.is_set():
+    # Read and parse the stream from the serial port byte by byte.
+    # This parsing works as a state machine (see the definitions in the __init__ method).
+    # See also the official documentation on http://smarty.creos.net/wp-content/uploads/P1PortSpecification.pdf
+    # For better human readability, we use the hexadecimal representation of the input.
+    hex_input = binascii.hexlify(raw_data)
 
-      # wait till parser has copied telegram content
-      # ...we need the opposite of trigger.wait()...block when set; not available
-      while self.__trigger.is_set():
-        time.sleep(0.1)
+    # Initial state. Input is ignored until start byte is detected.
+    if self._state == self.STATE_IGNORING:
+      if hex_input == b'db':
+        self._state = self.STATE_STARTED
+        self._buffer = b""
+        self._buffer_length = 1
+        self._system_title_length = 0
+        self._system_title = b""
+        self._data_length = 0
+        self._data_length_bytes = b""
+        self._frame_counter = b""
+        self._payload = b""
+        self._gcm_tag = b""
+      else:
+        return
 
-      # add a counter as first field to the list
-      self.__counter += 1
-      self.__telegram.append(f"{self.__counter}")
+    # Start byte (hex "DB") has been detected.
+    elif self._state == self.STATE_STARTED:
+      self._state = self.STATE_HAS_SYSTEM_TITLE_LENGTH
+      self._system_title_length = int(hex_input, 16)
+      self._buffer_length = self._buffer_length + 1
+      self._next_state = 2 + self._system_title_length  # start bytes + system title length
 
-      # Decode from binary to ascii
-      # Remove CR LF
-      line = self.__tty.readline().decode('utf-8').rstrip()
+    # Length of system title has been read.
+    elif self._state == self.STATE_HAS_SYSTEM_TITLE_LENGTH:
+      if self._buffer_length > self._next_state:
+        self._system_title += hex_input
+        self._state = self.STATE_HAS_SYSTEM_TITLE
+        self._next_state = self._next_state + 2  # read two more bytes
+      else:
+        self._system_title += hex_input
 
-      # First element in telegram starts with "!"
-      nrof_elements = 0
-      while (not self.__stopper.is_set()) and (not line.startswith('!') ):
+    # System title has been read.
+    elif self._state == self.STATE_HAS_SYSTEM_TITLE:
+      if hex_input == b'82':
+        self._next_state = self._next_state + 1
+        self._state = self.STATE_HAS_SYSTEM_TITLE_SUFFIX  # Ignore separator byte
+      else:
+        print("ERROR, expected 0x82 separator byte not found, dropping frame")
+        self._state = self.STATE_IGNORING
+
+
+    # Additional byte after the system title has been read.
+    elif self._state == self.STATE_HAS_SYSTEM_TITLE_SUFFIX:
+      if self._buffer_length > self._next_state:
+        self._data_length_bytes += hex_input
+        self._data_length = int(self._data_length_bytes, 16)
+        self._state = self.STATE_HAS_DATA_LENGTH
+      else:
+        self._data_length_bytes += hex_input
+
+    # Length of remaining data has been read.
+    elif self._state == self.STATE_HAS_DATA_LENGTH:
+      self._state = self.STATE_HAS_SEPARATOR  # Ignore separator byte
+      self._next_state = self._next_state + 1 + 4  # separator byte + 4 bytes for framecounter
+
+    # Additional byte after the remaining data length has been read.
+    elif self._state == self.STATE_HAS_SEPARATOR:
+      if self._buffer_length > self._next_state:
+        self._frame_counter += hex_input
+        self._state = self.STATE_HAS_FRAME_COUNTER
+        self._next_state = self._next_state + self._data_length - 17
+      else:
+        self._frame_counter += hex_input
+
+    # Frame counter has been read.
+    elif self._state == self.STATE_HAS_FRAME_COUNTER:
+      if self._buffer_length > self._next_state:
+        self._payload += hex_input
+        self._state = self.STATE_HAS_PAYLOAD
+        self._next_state = self._next_state + 12
+      else:
+        self._payload += hex_input
+
+    # Payload has been read.
+    elif self._state == self.STATE_HAS_PAYLOAD:
+      # All input has been read. After this, we switch back to STATE_IGNORING and wait for a new start byte.
+      if self._buffer_length > self._next_state:
+        self._gcm_tag += hex_input
+        self._state = self.STATE_DONE
+      else:
+        self._gcm_tag += hex_input
+
+    self._buffer += hex_input
+    self._buffer_length = self._buffer_length + 1
+
+    if self._state == self.STATE_DONE:
+      # print(self._buffer)
+
+      data = self.analyze()
+      for line in data.splitlines():
         self.__telegram.append(line)
-        line = self.__tty.readline().decode('utf-8').rstrip()
-        nrof_elements += 1
-#        logger.debug(f"TELEGRAM Element = {line}")
+        print(line);
 
-        # Only in simulator mode; detect EOF in file
-        if (not cfg.PRODUCTION) and line.startswith('EOF'):
-          self.__stopper.set()
-          logger.debug(f"EOF Detected in {cfg.SIMULATORFILE}")
-          break
+      self._state = self.STATE_IGNORING
 
       # do some magic on telegram
-      self.__preprocess()
+      #/self.__preprocess()
 
       # Trigger that new telegram is available for MQTT
       self.__trigger.set()
-
-      # In simulation mode, insert a delay
-      if not cfg.PRODUCTION:
-        # 1sec delay mimics dsmr behaviour, which transmits every 1sec a telegram
-        time.sleep(1.0)
-
     logger.debug("<<")
 
 
+    return
+
+
+    # Once we have a full encrypted "telegram", put everything together for decryption.
+  def analyze(self):
+
+    key = binascii.unhexlify(cfg.DECRYPT_KEY)
+    additional_data = binascii.unhexlify(cfg.DECRYPT_AAD)
+    iv = binascii.unhexlify(self._system_title + self._frame_counter)
+    payload = binascii.unhexlify(self._payload)
+    gcm_tag = binascii.unhexlify(self._gcm_tag)
+
+    decryption = self.decrypt(
+      key,
+      additional_data,
+      iv,
+      payload,
+      gcm_tag
+    )
+    return decryption.decode('utf-8', errors='ignore')
   def run(self):
-    logger.debug(">>")
-    try:
-      # In production, ReadSerial has infinite loop
-      # In simulation, ReadSerial will return @ EOF
+    parser = argparse.ArgumentParser()
+    self._args = parser.parse_args()
+
+    while True:
       self.__read_serial()
 
-    except Exception as e:
-      logger.error(f"Exception: {e}")
-
-    finally:
-      self.__tty.close()
-      self.__stopper.set()
-
-    logger.debug("<<")
+  def decrypt(self, key, additional_data, iv, payload, gcm_tag):
+      cipher = AES.new(key, AES.MODE_GCM, iv, mac_len=12)
+      cipher.update(additional_data)
+      return cipher.decrypt(payload)

@@ -1,4 +1,29 @@
-# DSMR MQTT
+# DSMR MQTT (FORKED FOR ENCRYPTED SMART READERS IN AUSTRIA)
+
+This fork adds the encryption used by some power providers to `dsmr2mqtt`.
+
+Basically all you need to do is to copy `config.rename.py` to `config.py` and adjust the settings for:
+* MQTT Broker
+* Provided keys from the power company. You might need to send them a polite email. They shouldn't have an issue with providing the keys.
+* Test by running `python3 dsmr-mqtt.py`. If you can see the decrypted data, proceed.
+****
+
+* Run `cp systemd/dsmr-mqtt.service /etc/systemd/system/dsmr-mqtt-service`
+* Run `systemctl enable power-mqtt.service` to execute the script
+
+***
+* Used P1 cable: https://www.amazon.de/dp/B07JW75BZ7?psc=1&ref=ppx_yo2ov_dt_b_product_details
+* Script is running on a Raspi 3B+
+
+***
+HomeAssistant
+- Create a Riemann sum integral sensor, set the MQTT sensor value ` sensor.momentane_wirkleistung_bezug_w` as entity, use `kilo` as metric and `hourly` as scale.
+- Create an Utility Meter with the sensor created above and set `Meter reset cycle` to never.
+- Go to https://my.home-assistant.io/redirect/config_energy/, press `Add Consumption` and add the created `Utility Meter` sensor.
+- Done
+
+# Original Text
+
 MQTT client for Dutch Smart Meter (DSMR) - "Slimme Meter". Written in Python 3.x
  
 Connect Smart Meter via a P1 USB cable to e.g. Raspberry Pi.
